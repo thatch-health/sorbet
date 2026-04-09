@@ -10,6 +10,7 @@
 #include "rapidjson/document.h"
 #include "rapidjson/writer.h"
 #include "subprocess.hpp"
+#include <cerrno>
 
 using namespace std;
 
@@ -40,6 +41,18 @@ template <typename F> void catchDeserializationError(spdlog::logger &logger, con
     }
 }
 
+void terminateWatchmanProcess(spdlog::logger &logger, int pid) {
+    if (pid <= 0) {
+        return;
+    }
+
+    if (kill(pid, SIGTERM) == 0 || errno == ESRCH) {
+        return;
+    }
+
+    logger.debug("Failed to terminate Watchman process {}: {}", pid, errno);
+}
+
 } // namespace
 
 void WatchmanProcess::start() {
@@ -49,200 +62,216 @@ void WatchmanProcess::start() {
 
         auto p = subprocess::Popen({watchmanPath.c_str(), "-j", "-p", "--no-pretty"},
                                    subprocess::output{subprocess::PIPE}, subprocess::input{subprocess::PIPE});
-
-        string modifiedWorkspace = workSpace;
-        if (!watchmanNamespace.empty()) {
-            const optional<string> maybeResolved = FileOps::realpath(workSpace);
-            if (!maybeResolved.has_value()) {
-                logger->debug("Unable to resolve workspace path {} for namespacing", workSpace);
-                watchmanNamespace.clear();
-            } else {
-                string_view root(*maybeResolved);
-                logger->debug("realpath({}) = {}", workSpace, root);
-                if (absl::ConsumeSuffix(&root, watchmanNamespace)) {
-                    string gitDirectory(root);
-                    gitDirectory += "/.git";
-                    if (FileOps::dirExists(gitDirectory)) {
-                        logger->debug("Using {} as watchman root", root);
-                        modifiedWorkspace = root;
+        auto pid = p.pid();
+        if (!registerWatchmanPid(pid)) {
+            terminateWatchmanProcess(*logger, pid);
+            p.wait();
+            clearWatchmanPid(pid);
+            return;
+        }
+        try {
+            string modifiedWorkspace = workSpace;
+            if (!watchmanNamespace.empty()) {
+                const optional<string> maybeResolved = FileOps::realpath(workSpace);
+                if (!maybeResolved.has_value()) {
+                    logger->debug("Unable to resolve workspace path {} for namespacing", workSpace);
+                    watchmanNamespace.clear();
+                } else {
+                    string_view root(*maybeResolved);
+                    logger->debug("realpath({}) = {}", workSpace, root);
+                    if (absl::ConsumeSuffix(&root, watchmanNamespace)) {
+                        string gitDirectory(root);
+                        gitDirectory += "/.git";
+                        if (FileOps::dirExists(gitDirectory)) {
+                            logger->debug("Using {} as watchman root", root);
+                            modifiedWorkspace = root;
+                        } else {
+                            logger->debug("Parent directory {} of namespace {} is not a git repository, disabling "
+                                          "namespacing",
+                                          root, watchmanNamespace);
+                            watchmanNamespace.clear();
+                        }
                     } else {
-                        logger->debug(
-                            "Parent directory {} of namespace {} is not a git repository, disabling namespacing", root,
-                            watchmanNamespace);
+                        logger->debug("Watched directory {} is not in namespace {}, disabling namespacing", root,
+                                      watchmanNamespace);
                         watchmanNamespace.clear();
                     }
-                } else {
-                    logger->debug("Watched directory {} is not in namespace {}, disabling namespacing", root,
-                                  watchmanNamespace);
-                    watchmanNamespace.clear();
                 }
             }
-        }
 
-        logger->debug("Starting monitoring path {} with watchman for files with extensions {}. Subscription id: {}",
-                      modifiedWorkspace, fmt::join(extensions, ","), subscriptionName);
+            logger->debug("Starting monitoring path {} with watchman for files with extensions {}. Subscription id: {}",
+                          modifiedWorkspace, fmt::join(extensions, ","), subscriptionName);
 
-        rapidjson::StringBuffer subscribeCommandBuffer;
-        rapidjson::Writer<rapidjson::StringBuffer> w(subscribeCommandBuffer);
-        {
-            w.StartArray();
-            w.String("subscribe");
-            w.String(modifiedWorkspace);
-            w.String(subscriptionName);
-
+            rapidjson::StringBuffer subscribeCommandBuffer;
+            rapidjson::Writer<rapidjson::StringBuffer> w(subscribeCommandBuffer);
             {
-                w.StartObject();
+                w.StartArray();
+                w.String("subscribe");
+                w.String(modifiedWorkspace);
+                w.String(subscriptionName);
 
-                w.String("expression");
                 {
-                    w.StartArray();
-                    w.String("allof");
+                    w.StartObject();
+
+                    w.String("expression");
                     {
                         w.StartArray();
-                        w.String("type");
-                        w.String("f");
-                        w.EndArray();
-                    }
-
-                    if (!watchmanNamespace.empty()) {
-                        w.StartArray();
-                        w.String("dirname");
-                        w.String(watchmanNamespace);
-                        w.EndArray();
-                    }
-
-                    // Note: Newer versions of Watchman (post 4.9.0) support ["suffix", ["suffix1", "suffix2", ...]],
-                    // but Stripe laptops have 4.9.0. Thus, we use [ "anyof", [ "suffix", "suffix1" ], [ "suffix",
-                    // "suffix2" ], ... ].
-                    {
-                        w.StartArray();
-                        w.String("anyof");
-
-                        for (auto &extension : extensions) {
+                        w.String("allof");
+                        {
                             w.StartArray();
-                            w.String("suffix");
-                            w.String(extension);
+                            w.String("type");
+                            w.String("f");
                             w.EndArray();
                         }
 
-                        w.EndArray();
-                    }
+                        if (!watchmanNamespace.empty()) {
+                            w.StartArray();
+                            w.String("dirname");
+                            w.String(watchmanNamespace);
+                            w.EndArray();
+                        }
 
-                    // Exclude rsync tmpfiles
-                    {
-                        w.StartArray();
-                        w.String("not");
+                        // Note: Newer versions of Watchman (post 4.9.0) support ["suffix", ["suffix1", "suffix2",
+                        // ...]], but Stripe laptops have 4.9.0. Thus, we use [ "anyof", [ "suffix", "suffix1" ],
+                        // [ "suffix", "suffix2" ], ... ].
                         {
                             w.StartArray();
-                            w.String("match");
-                            w.String("**/.~tmp~/**");
-                            w.String("wholename");
+                            w.String("anyof");
+
+                            for (auto &extension : extensions) {
+                                w.StartArray();
+                                w.String("suffix");
+                                w.String(extension);
+                                w.EndArray();
+                            }
+
+                            w.EndArray();
+                        }
+
+                        // Exclude rsync tmpfiles
+                        {
+                            w.StartArray();
+                            w.String("not");
                             {
-                                w.StartObject();
-                                w.String("includedotfiles");
-                                w.Bool(true);
-                                w.EndObject();
+                                w.StartArray();
+                                w.String("match");
+                                w.String("**/.~tmp~/**");
+                                w.String("wholename");
+                                {
+                                    w.StartObject();
+                                    w.String("includedotfiles");
+                                    w.Bool(true);
+                                    w.EndObject();
+                                }
+                                w.EndArray();
                             }
                             w.EndArray();
                         }
+
                         w.EndArray();
                     }
 
-                    w.EndArray();
+                    w.String("fields");
+                    {
+                        w.StartArray();
+                        w.String("name");
+                        w.EndArray();
+                    }
+
+                    // Note 2: `empty_on_fresh_instance` prevents Watchman from sending entire contents of folder if
+                    // this subscription starts the daemon / causes the daemon to watch this folder for the first time.
+                    w.String("empty_on_fresh_instance");
+                    w.Bool(true);
+
+                    w.EndObject();
                 }
 
-                w.String("fields");
-                {
-                    w.StartArray();
-                    w.String("name");
-                    w.EndArray();
-                }
-
-                // Note 2: `empty_on_fresh_instance` prevents Watchman from sending entire contents of folder if this
-                // subscription starts the daemon / causes the daemon to watch this folder for the first time.
-                w.String("empty_on_fresh_instance");
-                w.Bool(true);
-
-                w.EndObject();
+                w.EndArray();
             }
 
-            w.EndArray();
-        }
+            string subscribeCommand = subscribeCommandBuffer.GetString();
+            p.send(subscribeCommand.c_str(), subscribeCommand.size());
+            logger->debug(subscribeCommand);
 
-        string subscribeCommand = subscribeCommandBuffer.GetString();
-        p.send(subscribeCommand.c_str(), subscribeCommand.size());
-        logger->debug(subscribeCommand);
+            auto file = p.output();
+            auto fd = fileno(file);
 
-        auto file = p.output();
-        auto fd = fileno(file);
+            string buffer;
 
-        string buffer;
-
-        while (!isStopped()) {
-            errno = 0;
-            auto maybeLine = FileOps::readLineFromFd(fd, buffer);
-            if (maybeLine.result == FileOps::ReadResult::Timeout) {
-                // Timeout occurred. See if we should abort before reading further.
-                continue;
-            }
-
-            if (maybeLine.result == FileOps::ReadResult::ErrorOrEof) {
-                if (errno == EINTR) {
+            while (!isStopped()) {
+                errno = 0;
+                auto maybeLine = FileOps::readLineFromFd(fd, buffer);
+                if (maybeLine.result == FileOps::ReadResult::Timeout) {
+                    // Timeout occurred. See if we should abort before reading further.
                     continue;
                 }
 
-                // Exit loop; unable to read from Watchman process.
-                exitWithCode(1, nullopt);
-                break;
-            }
-
-            ENFORCE(maybeLine.result == FileOps::ReadResult::Success);
-
-            const string &line = *maybeLine.output;
-            // Line found!
-            rapidjson::MemoryPoolAllocator<> alloc;
-            rapidjson::Document d(&alloc);
-            logger->debug(line);
-            if (d.Parse(line.c_str(), line.size()).HasParseError()) {
-                logger->error("Error parsing Watchman response: `{}` is not a valid json object", line);
-            } else if (d.HasMember("is_fresh_instance")) {
-                catchDeserializationError(*logger, line, [&d, this]() {
-                    auto queryResponse = sorbet::realmain::lsp::WatchmanQueryResponse::fromJSONValue(d);
-                    if (!watchmanNamespace.empty()) {
-                        auto prefix(watchmanNamespace);
-                        prefix += "/";
-
-                        for (auto &file : queryResponse->files) {
-                            string_view view(file);
-                            if (!absl::ConsumePrefix(&view, prefix)) {
-                                continue;
-                            }
-                            file = view;
-                        }
+                if (maybeLine.result == FileOps::ReadResult::ErrorOrEof) {
+                    if (errno == EINTR) {
+                        continue;
                     }
-                    processQueryResponse(move(queryResponse));
-                });
-            } else if (d.HasMember("state-enter")) {
-                // These are messages from "state-enter" commands.  See
-                // https://facebook.github.io/watchman/docs/cmd/state-enter.html
-                // for more information.
-                catchDeserializationError(*logger, line, [&d, this]() {
-                    auto stateEnter = sorbet::realmain::lsp::WatchmanStateEnter::fromJSONValue(d);
-                    processStateEnter(move(stateEnter));
-                });
-            } else if (d.HasMember("state-leave")) {
-                // These are messages from "state-leave" commands.  See
-                // https://facebook.github.io/watchman/docs/cmd/state-leave.html
-                // for more information.
-                catchDeserializationError(*logger, line, [&d, this]() {
-                    auto stateLeave = sorbet::realmain::lsp::WatchmanStateLeave::fromJSONValue(d);
-                    processStateLeave(move(stateLeave));
-                });
-            } else if (!d.HasMember("subscribe")) {
-                // Something we don't understand yet.
-                logger->debug("Unknown Watchman response:\n{}", line);
+
+                    // Exit loop; unable to read from Watchman process.
+                    exitWithCode(1, nullopt);
+                    break;
+                }
+
+                ENFORCE(maybeLine.result == FileOps::ReadResult::Success);
+
+                const string &line = *maybeLine.output;
+                // Line found!
+                rapidjson::MemoryPoolAllocator<> alloc;
+                rapidjson::Document d(&alloc);
+                logger->debug(line);
+                if (d.Parse(line.c_str(), line.size()).HasParseError()) {
+                    logger->error("Error parsing Watchman response: `{}` is not a valid json object", line);
+                } else if (d.HasMember("is_fresh_instance")) {
+                    catchDeserializationError(*logger, line, [&d, this]() {
+                        auto queryResponse = sorbet::realmain::lsp::WatchmanQueryResponse::fromJSONValue(d);
+                        if (!watchmanNamespace.empty()) {
+                            auto prefix(watchmanNamespace);
+                            prefix += "/";
+
+                            for (auto &file : queryResponse->files) {
+                                string_view view(file);
+                                if (!absl::ConsumePrefix(&view, prefix)) {
+                                    continue;
+                                }
+                                file = view;
+                            }
+                        }
+                        processQueryResponse(move(queryResponse));
+                    });
+                } else if (d.HasMember("state-enter")) {
+                    // These are messages from "state-enter" commands.  See
+                    // https://facebook.github.io/watchman/docs/cmd/state-enter.html
+                    // for more information.
+                    catchDeserializationError(*logger, line, [&d, this]() {
+                        auto stateEnter = sorbet::realmain::lsp::WatchmanStateEnter::fromJSONValue(d);
+                        processStateEnter(move(stateEnter));
+                    });
+                } else if (d.HasMember("state-leave")) {
+                    // These are messages from "state-leave" commands.  See
+                    // https://facebook.github.io/watchman/docs/cmd/state-leave.html
+                    // for more information.
+                    catchDeserializationError(*logger, line, [&d, this]() {
+                        auto stateLeave = sorbet::realmain::lsp::WatchmanStateLeave::fromJSONValue(d);
+                        processStateLeave(move(stateLeave));
+                    });
+                } else if (!d.HasMember("subscribe")) {
+                    // Something we don't understand yet.
+                    logger->debug("Unknown Watchman response:\n{}", line);
+                }
             }
+        } catch (...) {
+            terminateWatchmanProcess(*logger, pid);
+            p.wait();
+            clearWatchmanPid(pid);
+            throw;
         }
+
+        p.wait();
+        clearWatchmanPid(pid);
     } catch (exception e) {
         // Ignore exceptions thrown on forked process.
         if (getpid() == mainPid) {
@@ -267,10 +296,37 @@ bool WatchmanProcess::isStopped() {
     return stopped;
 }
 
-void WatchmanProcess::exitWithCode(int code, const optional<string> &msg) {
+bool WatchmanProcess::registerWatchmanPid(int pid) {
     absl::MutexLock lck(&mutex);
-    if (!stopped) {
-        stopped = true;
+    if (stopped) {
+        return false;
+    }
+
+    watchmanPid = pid;
+    return true;
+}
+
+void WatchmanProcess::clearWatchmanPid(int pid) {
+    absl::MutexLock lck(&mutex);
+    if (watchmanPid == pid) {
+        watchmanPid = -1;
+    }
+}
+
+void WatchmanProcess::exitWithCode(int code, const optional<string> &msg) {
+    int pid = -1;
+    bool shouldProcessExit = false;
+    {
+        absl::MutexLock lck(&mutex);
+        if (!stopped) {
+            stopped = true;
+            pid = watchmanPid;
+            shouldProcessExit = true;
+        }
+    }
+
+    if (shouldProcessExit) {
+        terminateWatchmanProcess(*logger, pid);
         processExit(code, msg);
     }
 }

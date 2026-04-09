@@ -209,6 +209,23 @@ cc_test(
 )
 
 cc_test(
+    name = "watchman_process_test",
+    size = "small",
+    srcs = ["test/watchman_process_test.cc"],
+    linkstatic = select({
+        "//tools/config:linkshared": 0,
+        "//conditions:default": 1,
+    }),
+    visibility = ["//tools:__pkg__"],
+    deps = [
+        "lsp",
+        "//test/helpers",
+        "@doctest//doctest",
+        "@doctest//doctest:main",
+    ],
+)
+
+cc_test(
     name = "lsp_test",
     size = "small",
     srcs = ["test/lsp_test.cc"],

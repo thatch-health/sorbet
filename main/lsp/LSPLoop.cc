@@ -17,6 +17,12 @@
 #include "main/lsp/json_types.h"
 #include "main/lsp/notifications/sorbet_workspace_edit.h"
 #include "main/lsp/watchman/WatchmanProcess.h"
+#include <atomic>
+#ifdef __APPLE__
+#include <sys/event.h>
+#endif
+#include <poll.h>
+#include <unistd.h>
 
 using namespace std;
 
@@ -32,6 +38,18 @@ LSPLoop::LSPLoop(unique_ptr<core::GlobalState> initialGS, WorkerPool &workers,
       lastMetricUpdateTime(chrono::steady_clock::now()) {}
 
 constexpr chrono::minutes STATSD_INTERVAL = chrono::minutes(5);
+constexpr chrono::milliseconds OUTPUT_HANGUP_POLL_INTERVAL = chrono::milliseconds(100);
+
+namespace {
+bool shouldMonitorOutputHangups(const shared_ptr<LSPOutput> &output, LSPInput *input) {
+    return dynamic_cast<LSPStdout *>(output.get()) != nullptr && dynamic_cast<LSPFDInput *>(input) != nullptr;
+}
+
+void requestTermination(MessageQueueState &messageQueue, absl::Mutex &messageQueueMutex) {
+    absl::MutexLock lck(&messageQueueMutex);
+    messageQueue.terminate = true;
+}
+} // namespace
 
 bool LSPLoop::shouldSendCountersToStatsd(chrono::time_point<chrono::steady_clock> currentTime) const {
     // If --web-trace-file, always flush after every task (probably: someone is debugging).
@@ -198,6 +216,7 @@ optional<unique_ptr<core::GlobalState>> LSPLoop::runLSP(shared_ptr<LSPInput> inp
     // Notifies threads once LSP is initialized. Used to prevent Watchman thread from enqueueing messages that mutate
     // file state until after initialization.
     absl::Notification initializedNotification;
+    atomic<bool> stopOutputMonitor = false;
 
     auto typecheckThread = typecheckerCoord.startTypecheckerThread();
 
@@ -224,6 +243,70 @@ optional<unique_ptr<core::GlobalState>> LSPLoop::runLSP(shared_ptr<LSPInput> inp
             logger, opts.watchmanPath, opts.rawInputDirNames.at(0), vector<string>({"rb", "rbi"}), messageQueue,
             messageQueueMutex, initializedNotification, this->config, opts.watchmanNamespace);
     }
+
+    unique_ptr<Joinable> outputMonitorThread;
+    if (shouldMonitorOutputHangups(config->output, input.get())) {
+        outputMonitorThread =
+            runInAThread("lspOutputHangup", [&messageQueue, &messageQueueMutex, &logger = logger, &stopOutputMonitor] {
+#ifdef __APPLE__
+                int kq = kqueue();
+                if (kq == -1) {
+                    logger->debug("Unable to create kqueue for LSP output monitor");
+                    return;
+                }
+
+                struct kevent change;
+                EV_SET(&change, 1, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, nullptr);
+                if (kevent(kq, &change, 1, nullptr, 0, nullptr) == -1) {
+                    logger->debug("Unable to register kqueue event for LSP output monitor");
+                    close(kq);
+                    return;
+                }
+
+                while (!stopOutputMonitor.load()) {
+                    struct kevent event;
+                    struct timespec timeout;
+                    timeout.tv_sec = 0;
+                    timeout.tv_nsec = 1000 * 1000 * OUTPUT_HANGUP_POLL_INTERVAL.count();
+                    auto rv = kevent(kq, nullptr, 0, &event, 1, &timeout);
+                    if (rv <= 0) {
+                        continue;
+                    }
+                    if ((event.flags & EV_EOF) != 0 || (event.flags & EV_ERROR) != 0) {
+                        logger->debug("LSP output transport hangup detected");
+                        requestTermination(messageQueue, messageQueueMutex);
+                        close(kq);
+                        return;
+                    }
+                }
+                close(kq);
+#else
+                struct pollfd pfd;
+                pfd.fd = 1; // STDOUT
+                pfd.events = 0;
+                pfd.revents = 0;
+
+                while (!stopOutputMonitor.load()) {
+                    auto rv = poll(&pfd, 1, OUTPUT_HANGUP_POLL_INTERVAL / chrono::milliseconds(1));
+                    if (rv <= 0) {
+                        continue;
+                    }
+                    if ((pfd.revents & (POLLHUP | POLLERR)) != 0) {
+                        logger->debug("LSP output transport hangup detected");
+                        requestTermination(messageQueue, messageQueueMutex);
+                        return;
+                    }
+                }
+#endif
+            });
+    }
+
+    struct StopOutputMonitorOnDestruction final {
+        atomic<bool> &stop;
+        ~StopOutputMonitorOnDestruction() {
+            stop.store(true);
+        }
+    } stopOutputMonitorOnDestruction{stopOutputMonitor};
 
     auto readerThread =
         runInAThread("lspReader", [&messageQueue, &messageQueueMutex, logger = logger, input = move(input)] {

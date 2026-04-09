@@ -30,6 +30,8 @@ private:
     absl::Mutex mutex;
     // If true, the process has been stopped.
     bool stopped = false;
+    // PID of the active Watchman client subprocess, if one has been spawned.
+    int watchmanPid ABSL_GUARDED_BY(mutex) = -1;
 
     MessageQueueState &messageQueue;
     absl::Mutex &messageQueueMutex;
@@ -45,6 +47,8 @@ private:
     void exitWithCode(int code, const std::optional<std::string> &);
 
     bool isStopped();
+    bool registerWatchmanPid(int pid);
+    void clearWatchmanPid(int pid);
 
     void enqueueNotification(std::unique_ptr<NotificationMessage> notification);
 
