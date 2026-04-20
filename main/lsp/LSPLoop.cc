@@ -1,4 +1,5 @@
 #include "main/lsp/LSPLoop.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "common/EarlyReturnWithCode.h"
@@ -301,12 +302,7 @@ optional<unique_ptr<core::GlobalState>> LSPLoop::runLSP(shared_ptr<LSPInput> inp
             });
     }
 
-    struct StopOutputMonitorOnDestruction final {
-        atomic<bool> &stop;
-        ~StopOutputMonitorOnDestruction() {
-            stop.store(true);
-        }
-    } stopOutputMonitorOnDestruction{stopOutputMonitor};
+    auto stopOutputMonitorOnDestruction = absl::Cleanup([&stopOutputMonitor]() { stopOutputMonitor.store(true); });
 
     auto readerThread =
         runInAThread("lspReader", [&messageQueue, &messageQueueMutex, logger = logger, input = move(input)] {

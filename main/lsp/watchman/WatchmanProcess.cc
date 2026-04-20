@@ -1,4 +1,5 @@
 #include "WatchmanProcess.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/strings/strip.h"
 #include "common/FileOps.h"
 #include "common/common.h"
@@ -66,9 +67,9 @@ void WatchmanProcess::start() {
         if (!registerWatchmanPid(pid)) {
             terminateWatchmanProcess(*logger, pid);
             p.wait();
-            clearWatchmanPid(pid);
             return;
         }
+        auto clearWatchmanPidOnExit = absl::Cleanup([this, pid]() { clearWatchmanPid(pid); });
         try {
             string modifiedWorkspace = workSpace;
             if (!watchmanNamespace.empty()) {
@@ -266,12 +267,10 @@ void WatchmanProcess::start() {
         } catch (...) {
             terminateWatchmanProcess(*logger, pid);
             p.wait();
-            clearWatchmanPid(pid);
             throw;
         }
 
         p.wait();
-        clearWatchmanPid(pid);
     } catch (exception e) {
         // Ignore exceptions thrown on forked process.
         if (getpid() == mainPid) {
